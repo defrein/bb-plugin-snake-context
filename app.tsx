@@ -1,33 +1,29 @@
 // bb-plugin-snake-context — frontend entry.
 //
-// A pixel snake in the thread side panel. It moves only while the thread's
-// agent runs, and its length is the thread's context-window usage.
+// A pixel snake strip above the thread's chat input. It moves only while the
+// thread's agent runs, and its length is the thread's context-window usage.
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { KeyboardEvent as ReactKeyboardEvent } from "react";
-import {
-  definePluginApp,
-  experimental_useSidebarThreads,
-  useBbNavigate,
-  useSdk,
-} from "@get-bb/plugin-sdk/app";
+import { definePluginApp, useComposer, useSdk } from "@get-bb/plugin-sdk/app";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 
-const PANEL_ACTION_ID = "snake";
-const GRID = 24;
-const CELL = 14;
+const ROWS = 9;
+const CELL = 8;
+const MIN_COLS = 20;
+const MAX_COLS = 120;
 const TICK_MS = 140;
 const MIN_LENGTH = 3;
 // Full context fills this share of the board, leaving room to steer.
-const MAX_FILL = 0.75;
-const MAX_LENGTH = Math.floor(GRID * GRID * MAX_FILL);
+const MAX_FILL = 0.6;
 const CONTEXT_POLL_RUNNING_MS = 3_000;
 const CONTEXT_POLL_IDLE_MS = 15_000;
-const STATUS_POLL_MS = 2_000;
+const COLLAPSED_KEY = "bb-plugin-snake-context:collapsed";
 
 type Point = { x: number; y: number };
 type Dir = "up" | "down" | "left" | "right";
+type Size = { cols: number; rows: number };
 
 const DELTA: Record<Dir, Point> = {
   up: { x: 0, y: -1 },
@@ -52,39 +48,7 @@ const KEY_DIR: Record<string, Dir> = {
   d: "right",
 };
 
-const RUNNING_STATUSES = new Set(["starting", "active"]);
-
 type ContextUsage = { usedTokens: number; modelContextWindow: number };
-
-/** Whether the thread's agent is running, from the realtime sidebar list with a polling fallback. */
-function useAgentRunning(threadId: string): boolean | null {
-  const sdk = useSdk();
-  const sidebar = experimental_useSidebarThreads();
-  const fromSidebar = sidebar.threads.find((thread) => thread.id === threadId);
-  const [polled, setPolled] = useState<boolean | null>(null);
-
-  useEffect(() => {
-    if (fromSidebar) return;
-    const controller = new AbortController();
-    const poll = () => {
-      sdk.threads.get({ threadId, signal: controller.signal }).then(
-        (result) => {
-          setPolled(RUNNING_STATUSES.has(result.status));
-        },
-        () => {},
-      );
-    };
-    poll();
-    const timer = window.setInterval(poll, STATUS_POLL_MS);
-    return () => {
-      controller.abort();
-      window.clearInterval(timer);
-    };
-  }, [sdk, threadId, fromSidebar]);
-
-  if (fromSidebar) return RUNNING_STATUSES.has(fromSidebar.status);
-  return polled;
-}
 
 /** Latest recorded context-window usage; polls faster while the agent runs. */
 function useContextUsage(threadId: string, running: boolean): ContextUsage | null {
@@ -123,10 +87,11 @@ function useContextUsage(threadId: string, running: boolean): ContextUsage | nul
   return usage;
 }
 
-function lengthForUsage(usage: ContextUsage | null): number {
+function lengthForUsage(usage: ContextUsage | null, size: Size): number {
   if (!usage) return MIN_LENGTH;
   const ratio = Math.min(1, Math.max(0, usage.usedTokens / usage.modelContextWindow));
-  return Math.max(MIN_LENGTH, Math.round(ratio * MAX_LENGTH));
+  const max = Math.floor(size.cols * size.rows * MAX_FILL);
+  return Math.max(MIN_LENGTH, Math.round(ratio * max));
 }
 
 function formatTokens(tokens: number): string {
@@ -135,40 +100,45 @@ function formatTokens(tokens: number): string {
   return String(tokens);
 }
 
-const wrap = (value: number) => (value + GRID) % GRID;
+const wrap = (value: number, max: number) => (value + max) % max;
 const same = (a: Point, b: Point) => a.x === b.x && a.y === b.y;
 
-function spawn(length: number): Point[] {
+function spawn(length: number, size: Size): Point[] {
   // Coiled on one cell; the body unfolds as the head moves.
-  const centre = { x: Math.floor(GRID / 2), y: Math.floor(GRID / 2) };
+  const centre = { x: Math.floor(size.cols / 2), y: Math.floor(size.rows / 2) };
   return Array.from({ length }, () => ({ ...centre }));
 }
 
-function placeFood(body: readonly Point[]): Point {
-  const taken = new Set(body.map((p) => p.y * GRID + p.x));
-  if (taken.size >= GRID * GRID) return { x: 0, y: 0 };
+function placeFood(body: readonly Point[], size: Size): Point {
+  const cells = size.cols * size.rows;
+  const taken = new Set(body.map((p) => p.y * size.cols + p.x));
+  if (taken.size >= cells) return { x: 0, y: 0 };
   for (;;) {
-    const cell = Math.floor(Math.random() * GRID * GRID);
-    if (!taken.has(cell)) return { x: cell % GRID, y: Math.floor(cell / GRID) };
+    const cell = Math.floor(Math.random() * cells);
+    if (!taken.has(cell)) return { x: cell % size.cols, y: Math.floor(cell / size.cols) };
   }
 }
 
 /** Greedy autopilot: step toward food, avoiding the body when it can. */
-function autoSteer(body: readonly Point[], dir: Dir, food: Point): Dir {
+function autoSteer(body: readonly Point[], dir: Dir, food: Point, size: Size): Dir {
   const head = body[0]!;
-  const blocked = new Set(body.slice(0, -1).map((p) => p.y * GRID + p.x));
+  const blocked = new Set(body.slice(0, -1).map((p) => p.y * size.cols + p.x));
   const options = (Object.keys(DELTA) as Dir[]).filter((d) => d !== OPPOSITE[dir]);
   const score = (d: Dir) => {
-    const next = { x: wrap(head.x + DELTA[d].x), y: wrap(head.y + DELTA[d].y) };
-    if (blocked.has(next.y * GRID + next.x)) return Number.POSITIVE_INFINITY;
-    const dx = Math.min(Math.abs(next.x - food.x), GRID - Math.abs(next.x - food.x));
-    const dy = Math.min(Math.abs(next.y - food.y), GRID - Math.abs(next.y - food.y));
-    return dx + dy;
+    const next = {
+      x: wrap(head.x + DELTA[d].x, size.cols),
+      y: wrap(head.y + DELTA[d].y, size.rows),
+    };
+    if (blocked.has(next.y * size.cols + next.x)) return Number.POSITIVE_INFINITY;
+    const dx = Math.abs(next.x - food.x);
+    const dy = Math.abs(next.y - food.y);
+    return Math.min(dx, size.cols - dx) + Math.min(dy, size.rows - dy);
   };
   return options.reduce((best, d) => (score(d) < score(best) ? d : best), dir);
 }
 
 type Game = {
+  size: Size;
   body: Point[];
   dir: Dir;
   queued: Dir[];
@@ -178,17 +148,33 @@ type Game = {
   flashUntil: number;
 };
 
-function newGame(length: number): Game {
-  const body = spawn(length);
+function newGame(length: number, size: Size): Game {
+  const body = spawn(length, size);
   return {
+    size,
     body,
     dir: "right",
     queued: [],
-    food: placeFood(body),
+    food: placeFood(body, size),
     score: 0,
     crashes: 0,
     flashUntil: 0,
   };
+}
+
+/** Fit an existing game to a resized board without resetting score. */
+function resizeGame(game: Game, size: Size) {
+  game.size = size;
+  game.body = game.body.map((p) => ({ x: p.x % size.cols, y: p.y % size.rows }));
+  if (game.food.x >= size.cols || game.food.y >= size.rows) {
+    game.food = placeFood(game.body, size);
+  }
+}
+
+function fitLength(game: Game, target: number) {
+  // Grow from the tail, or shrink after compaction.
+  while (game.body.length < target) game.body.push({ ...game.body[game.body.length - 1]! });
+  if (game.body.length > target) game.body.length = target;
 }
 
 function readCssColor(element: HTMLElement, variable: string, fallback: string): string {
@@ -197,75 +183,148 @@ function readCssColor(element: HTMLElement, variable: string, fallback: string):
   return /^[\d.]+\s/.test(value) ? `hsl(${value})` : value;
 }
 
-function SnakePanel({ threadId }: { threadId: string }) {
-  const running = useAgentRunning(threadId);
-  const isRunning = running === true;
-  const usage = useContextUsage(threadId, isRunning);
-  const targetLength = lengthForUsage(usage);
+function useCollapsed(): [boolean, (value: boolean) => void] {
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return window.localStorage.getItem(COLLAPSED_KEY) === "1";
+    } catch {
+      return false;
+    }
+  });
+  const update = useCallback((value: boolean) => {
+    setCollapsed(value);
+    try {
+      window.localStorage.setItem(COLLAPSED_KEY, value ? "1" : "0");
+    } catch {
+      // Storage can be unavailable; the toggle still works for this session.
+    }
+  }, []);
+  return [collapsed, update];
+}
 
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+/** Composer banner: only thread composers carry a thread id. */
+function SnakeBanner() {
+  const composer = useComposer();
+  if (composer.scope.kind !== "thread") return null;
+  return <SnakeStrip threadId={composer.scope.threadId} running={composer.isRunning} />;
+}
+
+function SnakeStrip({ threadId, running }: { threadId: string; running: boolean }) {
+  const usage = useContextUsage(threadId, running);
+  const [collapsed, setCollapsed] = useCollapsed();
+  const percent = usage ? Math.min(100, (usage.usedTokens / usage.modelContextWindow) * 100) : null;
+
+  return (
+    <div className="flex w-full flex-col gap-1.5 text-xs">
+      <div className="flex items-center gap-2 font-mono">
+        <span
+          className={cn(
+            "inline-block size-2 shrink-0 rounded-full",
+            running ? "animate-pulse bg-green-500" : "bg-muted-foreground",
+          )}
+          aria-hidden
+        />
+        <span className="shrink-0">🐍 {running ? "running" : "paused"}</span>
+        <div className="h-1 min-w-8 flex-1 overflow-hidden rounded bg-muted">
+          <div className="h-full bg-green-500 transition-all" style={{ width: `${percent ?? 0}%` }} />
+        </div>
+        <span className="shrink-0 text-muted-foreground">
+          {usage
+            ? `${formatTokens(usage.usedTokens)}/${formatTokens(usage.modelContextWindow)} · ${percent!.toFixed(1)}%`
+            : "no context yet"}
+        </span>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-6 shrink-0"
+          aria-label={collapsed ? "Show snake" : "Hide snake"}
+          aria-expanded={!collapsed}
+          onClick={() => setCollapsed(!collapsed)}
+        >
+          <Icon name={collapsed ? "ChevronUp" : "ChevronDown"} className="size-3.5" />
+        </Button>
+      </div>
+      {!collapsed && <SnakeBoard running={running} usage={usage} />}
+    </div>
+  );
+}
+
+function SnakeBoard({ running, usage }: { running: boolean; usage: ContextUsage | null }) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const boardRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [size, setSize] = useState<Size>({ cols: 48, rows: ROWS });
+  const targetLength = lengthForUsage(usage, size);
+
   const gameRef = useRef<Game | null>(null);
-  gameRef.current ??= newGame(targetLength);
+  gameRef.current ??= newGame(targetLength, size);
   const targetLengthRef = useRef(targetLength);
-  const autoRef = useRef(false);
+  targetLengthRef.current = targetLength;
   const [auto, setAuto] = useState(false);
+  const autoRef = useRef(auto);
+  autoRef.current = auto;
   const [hud, setHud] = useState({ score: 0, crashes: 0, length: targetLength });
 
-  targetLengthRef.current = targetLength;
-  autoRef.current = auto;
+  // Board width follows the composer; rows stay fixed so the strip stays short.
+  useEffect(() => {
+    const element = containerRef.current;
+    if (!element) return;
+    const measure = () => {
+      const cols = Math.max(MIN_COLS, Math.min(MAX_COLS, Math.floor(element.clientWidth / CELL)));
+      setSize((prev) => (prev.cols === cols ? prev : { cols, rows: ROWS }));
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
 
   const draw = useCallback(() => {
     const canvas = canvasRef.current;
-    if (!canvas) return;
+    const game = gameRef.current;
+    if (!canvas || !game) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    const game = gameRef.current!;
+    const { cols, rows } = game.size;
     const fg = readCssColor(canvas, "--foreground", "#e5e5e5");
-    const muted = readCssColor(canvas, "--muted", "#262626");
-    const accent = "#4ade80";
+    const bg = readCssColor(canvas, "--muted", "#262626");
+    const body = "#4ade80";
     const head = "#22c55e";
     const food = "#f43f5e";
 
-    ctx.fillStyle = muted;
+    ctx.fillStyle = bg;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.globalAlpha = 0.08;
+    ctx.globalAlpha = 0.06;
     ctx.fillStyle = fg;
-    for (let y = 0; y < GRID; y++) {
-      for (let x = 0; x < GRID; x++) {
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
         if ((x + y) % 2 === 0) ctx.fillRect(x * CELL, y * CELL, CELL, CELL);
       }
     }
     ctx.globalAlpha = 1;
 
     ctx.fillStyle = food;
-    ctx.fillRect(game.food.x * CELL + 3, game.food.y * CELL + 3, CELL - 6, CELL - 6);
+    ctx.fillRect(game.food.x * CELL + 2, game.food.y * CELL + 2, CELL - 4, CELL - 4);
 
     const flashing = performance.now() < game.flashUntil;
     for (let i = game.body.length - 1; i >= 0; i--) {
       const p = game.body[i]!;
-      ctx.fillStyle = flashing ? food : i === 0 ? head : accent;
+      ctx.fillStyle = flashing ? food : i === 0 ? head : body;
       ctx.globalAlpha = i === 0 ? 1 : 0.55 + 0.45 * (1 - i / game.body.length);
       ctx.fillRect(p.x * CELL + 1, p.y * CELL + 1, CELL - 2, CELL - 2);
     }
     ctx.globalAlpha = 1;
-    const h = game.body[0]!;
-    ctx.fillStyle = "#052e16";
-    ctx.fillRect(h.x * CELL + 4, h.y * CELL + 4, 2, 2);
-    ctx.fillRect(h.x * CELL + CELL - 6, h.y * CELL + 4, 2, 2);
   }, []);
 
   const step = useCallback(() => {
     const game = gameRef.current!;
+    const { size: s } = game;
     const target = targetLengthRef.current;
-
-    // Grow from the tail, or shrink after compaction.
-    while (game.body.length < target) game.body.push({ ...game.body[game.body.length - 1]! });
-    if (game.body.length > target) game.body.length = target;
+    fitLength(game, target);
 
     if (autoRef.current) {
       game.queued = [];
-      game.dir = autoSteer(game.body, game.dir, game.food);
+      game.dir = autoSteer(game.body, game.dir, game.food, s);
     } else {
       const next = game.queued.shift();
       if (next && next !== OPPOSITE[game.dir]) game.dir = next;
@@ -273,8 +332,8 @@ function SnakePanel({ threadId }: { threadId: string }) {
 
     const head = game.body[0]!;
     const moved = {
-      x: wrap(head.x + DELTA[game.dir].x),
-      y: wrap(head.y + DELTA[game.dir].y),
+      x: wrap(head.x + DELTA[game.dir].x, s.cols),
+      y: wrap(head.y + DELTA[game.dir].y, s.rows),
     };
     const tail = game.body.slice(0, -1);
     // Segments still coiled on the spawn cell are not solid yet.
@@ -282,7 +341,7 @@ function SnakePanel({ threadId }: { threadId: string }) {
 
     if (bit) {
       game.crashes += 1;
-      game.body = spawn(target);
+      game.body = spawn(target, s);
       game.dir = "right";
       game.queued = [];
       game.flashUntil = performance.now() + 400;
@@ -290,14 +349,23 @@ function SnakePanel({ threadId }: { threadId: string }) {
       game.body = [moved, ...tail];
       if (same(moved, game.food)) {
         game.score += 1;
-        game.food = placeFood(game.body);
+        game.food = placeFood(game.body, s);
       }
     }
     setHud({ score: game.score, crashes: game.crashes, length: game.body.length });
   }, []);
 
+  // Apply board resizes and context changes, then repaint (also while frozen).
   useEffect(() => {
-    if (!isRunning) {
+    const game = gameRef.current!;
+    if (game.size.cols !== size.cols || game.size.rows !== size.rows) resizeGame(game, size);
+    fitLength(game, targetLength);
+    setHud((prev) => ({ ...prev, length: game.body.length }));
+    draw();
+  }, [size, targetLength, draw]);
+
+  useEffect(() => {
+    if (!running) {
       draw();
       return;
     }
@@ -306,17 +374,7 @@ function SnakePanel({ threadId }: { threadId: string }) {
       draw();
     }, TICK_MS);
     return () => window.clearInterval(timer);
-  }, [isRunning, step, draw]);
-
-  // Repaint when length changes while frozen, so idle threads still show their size.
-  useEffect(() => {
-    if (isRunning) return;
-    const game = gameRef.current!;
-    while (game.body.length < targetLength) game.body.push({ ...game.body[game.body.length - 1]! });
-    if (game.body.length > targetLength) game.body.length = targetLength;
-    setHud((prev) => ({ ...prev, length: game.body.length }));
-    draw();
-  }, [isRunning, targetLength, draw]);
+  }, [running, step, draw]);
 
   const turn = useCallback((dir: Dir) => {
     const game = gameRef.current!;
@@ -334,71 +392,46 @@ function SnakePanel({ threadId }: { threadId: string }) {
     const dir = KEY_DIR[event.key] ?? KEY_DIR[event.key.toLowerCase()];
     if (!dir) return;
     event.preventDefault();
+    event.stopPropagation();
     turn(dir);
   };
 
-  const percent = usage ? Math.min(100, (usage.usedTokens / usage.modelContextWindow) * 100) : null;
-  const statusLabel =
-    running === null ? "Checking agent…" : isRunning ? "Agent running" : "Agent idle — paused";
-
   return (
-    <div className="flex h-full min-h-0 flex-col items-center gap-3 overflow-auto p-3 text-sm">
-      <div className="flex w-full max-w-[336px] items-center justify-between gap-2 font-mono text-xs">
-        <span className="flex items-center gap-1.5">
-          <span
-            className={cn(
-              "inline-block size-2 rounded-full",
-              isRunning ? "animate-pulse bg-green-500" : "bg-muted-foreground",
-            )}
-            aria-hidden
+    <div className="flex items-stretch gap-2">
+      <div ref={containerRef} className="min-w-0 flex-1">
+        <div
+          ref={boardRef}
+          tabIndex={0}
+          role="application"
+          aria-label="Snake board. Arrow keys or WASD steer, Space toggles autopilot."
+          onKeyDown={onKeyDown}
+          className="relative w-fit overflow-hidden rounded border border-border outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <canvas
+            ref={canvasRef}
+            width={size.cols * CELL}
+            height={size.rows * CELL}
+            className="block"
+            style={{ imageRendering: "pixelated" }}
+            onClick={() => boardRef.current?.focus()}
           />
-          {statusLabel}
-        </span>
-        <span className="text-muted-foreground">
-          🍎 {hud.score} · 💥 {hud.crashes}
-        </span>
-      </div>
-
-      <div
-        ref={boardRef}
-        tabIndex={0}
-        role="application"
-        aria-label="Snake board. Arrow keys or WASD steer, Space toggles autopilot."
-        onKeyDown={onKeyDown}
-        className="relative rounded-md border border-border outline-none focus-visible:ring-2 focus-visible:ring-ring"
-      >
-        <canvas
-          ref={canvasRef}
-          width={GRID * CELL}
-          height={GRID * CELL}
-          className="block max-w-full"
-          style={{ imageRendering: "pixelated" }}
-          onClick={() => boardRef.current?.focus()}
-        />
-        {!isRunning && (
-          <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/40">
-            <span className="rounded bg-background/80 px-2 py-1 font-mono text-xs tracking-widest">
-              PAUSED
-            </span>
-          </div>
-        )}
-      </div>
-
-      <div className="w-full max-w-[336px] space-y-1">
-        <div className="flex justify-between font-mono text-xs text-muted-foreground">
-          <span>Length {hud.length}</span>
-          <span>
-            {usage
-              ? `${formatTokens(usage.usedTokens)} / ${formatTokens(usage.modelContextWindow)} (${percent!.toFixed(1)}%)`
-              : "No context usage yet"}
-          </span>
+          {!running && (
+            <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-background/30">
+              <span className="rounded bg-background/80 px-1.5 py-0.5 font-mono text-[10px] tracking-widest">
+                PAUSED · waiting for agent
+              </span>
+            </div>
+          )}
         </div>
-        <div className="h-1.5 w-full overflow-hidden rounded bg-muted">
-          <div className="h-full bg-green-500 transition-all" style={{ width: `${percent ?? 0}%` }} />
+        <div className="mt-1 flex gap-3 font-mono text-[10px] text-muted-foreground">
+          <span>len {hud.length}</span>
+          <span>🍎 {hud.score}</span>
+          <span>💥 {hud.crashes}</span>
+          <span className="hidden sm:inline">click board · arrows/WASD · space = auto</span>
         </div>
       </div>
 
-      <div className="grid grid-cols-3 gap-1" aria-label="Direction controls">
+      <div className="grid shrink-0 grid-cols-3 gap-0.5 self-start" aria-label="Direction controls">
         <span />
         <DirButton dir="up" icon="ArrowUp" onTurn={turn} />
         <span />
@@ -406,12 +439,12 @@ function SnakePanel({ threadId }: { threadId: string }) {
         <Button
           variant={auto ? "default" : "outline"}
           size="icon"
-          className="size-10 font-mono text-[10px]"
+          className="size-6 font-mono text-[8px]"
           aria-pressed={auto}
           aria-label="Toggle autopilot"
           onClick={() => setAuto((value) => !value)}
         >
-          AUTO
+          A
         </Button>
         <DirButton dir="right" icon="ArrowRight" onTurn={turn} />
         <span />
@@ -427,51 +460,23 @@ function DirButton({ dir, icon, onTurn }: { dir: Dir; icon: string; onTurn: (dir
     <Button
       variant="outline"
       size="icon"
-      className="size-10"
+      className="size-6"
       aria-label={`Turn ${dir}`}
       onPointerDown={(event) => {
+        // Keep focus in the composer so typing is not interrupted.
         event.preventDefault();
         onTurn(dir);
       }}
     >
-      <Icon name={icon} className="size-4" />
-    </Button>
-  );
-}
-
-/** Header button: shows live context share and opens the snake panel. */
-function SnakeHeaderButton({ threadId, isCompactViewport }: { threadId: string; isCompactViewport: boolean }) {
-  const navigate = useBbNavigate();
-  const running = useAgentRunning(threadId) === true;
-  const usage = useContextUsage(threadId, running);
-  const percent = usage ? Math.round((usage.usedTokens / usage.modelContextWindow) * 100) : null;
-  return (
-    <Button
-      variant="ghost"
-      size="sm"
-      className="h-7 gap-1 px-2 font-mono text-xs"
-      aria-label="Open context snake"
-      onClick={() => navigate.openThreadPanel({ actionId: PANEL_ACTION_ID, title: "Snake" })}
-    >
-      <span className={cn(running && "animate-pulse")} aria-hidden>
-        🐍
-      </span>
-      {!isCompactViewport && percent !== null && <span>{percent}%</span>}
+      <Icon name={icon} className="size-3" />
     </Button>
   );
 }
 
 export default definePluginApp((app) => {
-  app.slots.threadPanelAction({
-    id: PANEL_ACTION_ID,
-    title: "Snake",
-    icon: "Gamepad2",
-    layout: "flush",
-    component: ({ threadId }) => <SnakePanel key={threadId} threadId={threadId} />,
-  });
-  app.slots.experimental_threadHeaderAction({
-    id: "snake-button",
-    title: "Context snake",
-    component: SnakeHeaderButton,
+  app.composer.customize({
+    id: "snake",
+    scopes: ["thread"],
+    banners: [{ id: "snake-board", chrome: "card", component: SnakeBanner }],
   });
 });
